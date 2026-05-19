@@ -22,11 +22,11 @@ USERNAME=""
 USER_SUFFIX=""
 
 # Login credentials installed for $USERNAME.
-# At least one of SSH_PUBKEY and USER_PASSWORD must be set, or there is no way
-# to log in to the new system.
-SSH_PUBKEY=""    # e.g. "ssh-ed25519 AAAA... you@host"
-USER_PASSWORD="" # plain text; hashed at install time and written via chpasswd -e.
-                 # Leave empty to keep the account password-locked (SSH key only).
+# USER_PASSWORD is required (used for login if SSH_PUBKEY is unset, and always
+# used by sudo). SSH_PUBKEY is optional.
+SSH_PUBKEY=""    # optional; e.g. "ssh-ed25519 AAAA... you@host"
+USER_PASSWORD="" # required; plain text, hashed at install time and written via chpasswd -e.
+                 # Leave blank to be prompted interactively (entered twice for confirmation).
 
 UBUNTU_CODENAME=noble      # 24.04 LTS "Noble Numbat"
 UBUNTU_MIRROR=http://archive.ubuntu.com/ubuntu
@@ -73,8 +73,20 @@ trap 'echo "FAILED at line $LINENO" >&2; unmount_all; exit 1' ERR
 for v in DISK1_ID DISK2_ID NEW_HOSTNAME USERNAME; do
     [[ -n "${!v}" ]] || fatal "$v is empty — edit the CONFIGURATION section"
 done
-[[ -n "$SSH_PUBKEY" || -n "$USER_PASSWORD" ]] || \
-    fatal "Set SSH_PUBKEY and/or USER_PASSWORD, or you cannot log in to the installed system"
+if [[ -z "$USER_PASSWORD" ]]; then
+    [[ -t 0 ]] || fatal "USER_PASSWORD is empty and stdin is not a TTY — set it in CONFIGURATION or run interactively"
+    while :; do
+        read -rsp "Set password for ${USERNAME} (input hidden): " _p1; echo
+        [[ -n "$_p1" ]] || { echo "  Password cannot be empty."; continue; }
+        read -rsp "Confirm password: " _p2; echo
+        if [[ "$_p1" == "$_p2" ]]; then
+            USER_PASSWORD="$_p1"
+            unset _p1 _p2
+            break
+        fi
+        echo "  Passwords did not match — try again."
+    done
+fi
 : "${USER_SUFFIX:=$NEW_HOSTNAME}"
 
 # 1. Refuse to run on any known production host
@@ -139,12 +151,9 @@ info "Installing prerequisites..."
 apt-get install -y --no-install-recommends debootstrap zfsutils-linux rsync openssl
 modprobe zfs
 
-USER_PASSWORD_HASH=""
-if [[ -n "$USER_PASSWORD" ]]; then
-    # SHA-512 crypt ($6$). PAM on modern Ubuntu accepts it; yescrypt is
-    # preferred but needs the whois package (mkpasswd) which isn't standard.
-    USER_PASSWORD_HASH=$(openssl passwd -6 "$USER_PASSWORD")
-fi
+# SHA-512 crypt ($6$). PAM on modern Ubuntu accepts it; yescrypt is
+# preferred but needs the whois package (mkpasswd) which isn't standard.
+USER_PASSWORD_HASH=$(openssl passwd -6 "$USER_PASSWORD")
 
 #══════════════════════════════════════════════════════════════════════════════
 # 1. Partition both disks identically
@@ -233,11 +242,10 @@ zfs create -o com.sun:auto-snapshot=false \
            -o setuid=off                             "$RPOOL/ROOT/ubuntu_$NEW_HOSTNAME/tmp"
 
 # /usr must stay in the root dataset: /etc/os-release is a symlink to
-# /usr/lib/os-release, and grub-mkconfig's 10_linux_zfs mounts the root dataset
-# alone at a temp dir to read os-release. A separate /usr dataset leaves /usr
-# empty in that temp mount, breaking symlink resolution and producing a
-# grub.cfg with no Linux entries. Verified on 26.04; same symlink layout in
-# 24.04 — applied preventatively here and to be confirmed during testing.
+# /usr/lib/os-release, and grub-mkconfig's 10_linux_zfs mounts the root
+# dataset alone at a temp dir to read os-release. A separate /usr dataset
+# leaves /usr empty in that temp mount, breaking symlink resolution and
+# producing a grub.cfg with no Linux entries.
 
 # /var and its subtrees — parent dataset created first so children
 # are proper ZFS children rather than path-embedded datasets.
@@ -390,24 +398,26 @@ apt-get install -y \
     curl \
     wget \
     vim \
+    nano \
     net-tools \
     iproute2 \
     dosfstools \
     netplan.io \
     systemd-resolved \
     chrony \
-    bash-completion
+    bash-completion \
+    man-db \
+    manpages
 
-# User creation: passwordless sudo. Password is either set from the hash
-# (chpasswd -e) or the account stays locked for SSH-key-only access.
+# User creation. Standard Ubuntu sudoer: member of sudo,adm; sudo prompts
+# for the user's own password (Ubuntu's default %sudo ALL=(ALL:ALL) ALL).
+# Root account permanently locked.
 useradd -m -s /bin/bash -G sudo,adm "$USERNAME"
-if [[ -n "$USER_PASSWORD_HASH" ]]; then
-    echo "${USERNAME}:${USER_PASSWORD_HASH}" | chpasswd -e
-else
-    passwd -l "$USERNAME"
-fi
-echo "${USERNAME} ALL=(ALL) NOPASSWD:ALL" > "/etc/sudoers.d/${USERNAME}"
-chmod 440 "/etc/sudoers.d/${USERNAME}"
+echo "${USERNAME}:${USER_PASSWORD_HASH}" | chpasswd -e
+# /home/$USERNAME pre-exists as its own ZFS dataset, so useradd -m skips
+# /etc/skel. Copy it ourselves with --no-clobber so anything we wrote
+# earlier (notably .ssh/authorized_keys) is preserved.
+cp -a --update=none /etc/skel/. "/home/${USERNAME}/"
 chown -R "${USERNAME}:${USERNAME}" "/home/${USERNAME}"
 passwd -l root
 
@@ -447,6 +457,11 @@ systemctl enable zfs-import-bpool.service
 cat > /etc/default/grub <<GRUBEOF
 GRUB_DEFAULT=0
 GRUB_TIMEOUT=5
+# On ZFS root, GRUB can't reliably clear the recordfail flag in grubenv,
+# so every boot is treated as "previous boot failed" and GRUB_RECORDFAIL_TIMEOUT
+# (Ubuntu default: 30s, sometimes -1 = wait forever) overrides GRUB_TIMEOUT.
+# Pin it to the same 5s so the boot menu behaves predictably.
+GRUB_RECORDFAIL_TIMEOUT=5
 GRUB_DISTRIBUTOR="Ubuntu"
 GRUB_CMDLINE_LINUX_DEFAULT=""
 # 10_linux_zfs injects root=ZFS=<dataset> into each menuentry from the dataset
@@ -526,7 +541,7 @@ echo "
   ZFS pools exported. Remove the live USB and reboot.
 
   First boot: SSH in as $USERNAME@<ip>
-              SSH key login: $( [[ -n "$SSH_PUBKEY" ]]    && echo enabled || echo "disabled (no SSH_PUBKEY)" )
-              Password login: $( [[ -n "$USER_PASSWORD" ]] && echo enabled || echo "disabled (account locked)" )
+              SSH key login: $( [[ -n "$SSH_PUBKEY" ]] && echo enabled || echo "disabled (no SSH_PUBKEY)" )
+              Password login: enabled (sudo will prompt for the user's password)
               Root login is disabled in any case.
 ══════════════════════════════════════════════════════"

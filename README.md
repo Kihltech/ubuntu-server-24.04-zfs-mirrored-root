@@ -6,13 +6,10 @@ a two-disk ZFS mirror, booting via UEFI. Modelled on the
 and the [26.04 sibling repository](https://github.com/Kihltech/ubuntu-server-26.04-zfs-mirrored-root).
 
 This first release covers a **two-disk mirror only**. No encryption, no
-single-disk, no raidz; those branches will come in later releases.
+single-disk, no raidz; those branches will potentially come in later releases.
 
-> **Status:** this guide and script were authored alongside the verified
-> 26.04 procedure and have not yet been end-to-end tested on 24.04 hardware.
-> Treat anything unique to 24.04 (kernel, ZFS userspace, `10_linux_zfs`
-> internals) as needing verification on first run. The structural choices
-> below should hold; the package names and codename certainly do.
+> **Status:** both the manual procedure below and the automated
+> `install-zfs-ubuntu.sh` have been end-to-end verified on 24.04 hardware.
 
 There are two ways to use this repository:
 
@@ -27,8 +24,9 @@ There are two ways to use this repository:
 The OpenZFS 22.04 guide recommends a separate `/usr` dataset. On Ubuntu 26.04
 that produces a system that does not boot, in an unusually silent way; the
 24.04 toolchain ships the same `os-release` layout and the same
-`/etc/grub.d/10_linux_zfs` lineage, so the same risk applies until proven
-otherwise.
+`/etc/grub.d/10_linux_zfs` lineage, so the same hazard applies. The 24.04
+install verified here follows the structural fix below (no separate `/usr`)
+and boots without issue.
 
 `/etc/os-release` is a symlink to `../usr/lib/os-release`. `grub-mkconfig`'s
 `/etc/grub.d/10_linux_zfs` reads `os-release` to identify each candidate
@@ -320,16 +318,19 @@ chmod 600 "$MNT/home/$USER/.ssh/authorized_keys"
 # ownership is fixed after useradd inside the chroot
 ```
 
-If you also want password login, hash a password now so the plaintext does
-not leave the live session. Leave `PWHASH` empty to keep the account
-password-locked (SSH key only):
+Hash a password now so the plaintext does not leave the live session. A
+password is required: even with SSH key login it's needed for `sudo`, which
+uses Ubuntu's default policy (members of the `sudo` group authenticate with
+their own password).
 
 ```sh
-PWHASH=$(openssl passwd -6 'YourPasswordHere')
-# PWHASH=""   # ...or empty for key-only
+PWHASH=$(openssl passwd -6)
 ```
 
 ## Step 7 — Bind-mount and chroot
+
+Bind the live system's `/dev`, `/proc`, `/sys` (and EFI variables, on UEFI
+hosts) into `$MNT` so the chroot can see real kernel interfaces:
 
 ```sh
 mount --bind /dev          "$MNT/dev"
@@ -338,7 +339,22 @@ mount --bind /proc         "$MNT/proc"
 mount --bind /sys          "$MNT/sys"
 [ -d /sys/firmware/efi/efivars ] && \
     mount -t efivarfs efivarfs "$MNT/sys/firmware/efi/efivars"
+```
 
+Verify the bind mounts succeeded before chrooting:
+
+```sh
+mount | grep "$MNT"
+```
+
+You should see entries for `$MNT/dev`, `$MNT/dev/pts`, `$MNT/proc`,
+`$MNT/sys` (and `$MNT/sys/firmware/efi/efivars` on UEFI). If any are
+missing, fix them before proceeding — installing GRUB without `/sys` or
+`efivars` will fail or produce a broken installation.
+
+Enter the chroot:
+
+```sh
 chroot "$MNT" /usr/bin/env -i \
     HOME=/root TERM="$TERM" DEBIAN_FRONTEND=noninteractive \
     HOST="$HOST" USER="$USER" PWHASH="$PWHASH" \
@@ -367,25 +383,26 @@ apt-get install -y \
     linux-image-generic linux-headers-generic \
     zfsutils-linux zfs-initramfs \
     grub-efi-amd64 grub-efi-amd64-signed shim-signed \
-    openssh-server sudo curl wget vim \
+    openssh-server sudo curl wget vim nano \
     net-tools iproute2 dosfstools netplan.io \
-    systemd-resolved chrony bash-completion
+    systemd-resolved chrony bash-completion \
+    man-db manpages
 ```
 
 ### User account
 
-Passwordless sudo, password set from `$PWHASH` (or locked if empty), root
-account permanently locked:
+Standard Ubuntu sudoer: `$USER` joins the `sudo` and `adm` groups, so `sudo`
+prompts for the user's own password (Ubuntu's default
+`%sudo ALL=(ALL:ALL) ALL`). Root account permanently locked:
+
+`/home/$USER` already exists as its own ZFS dataset, so `useradd -m` skips
+copying `/etc/skel`. We copy it manually with `--no-clobber` so the
+`.ssh/authorized_keys` written earlier is preserved.
 
 ```sh
 useradd -m -s /bin/bash -G sudo,adm "$USER"
-if [ -n "$PWHASH" ]; then
-    echo "${USER}:${PWHASH}" | chpasswd -e
-else
-    passwd -l "$USER"
-fi
-echo "${USER} ALL=(ALL) NOPASSWD:ALL" > "/etc/sudoers.d/${USER}"
-chmod 440 "/etc/sudoers.d/${USER}"
+echo "${USER}:${PWHASH}" | chpasswd -e
+cp -a --update=none /etc/skel/. "/home/${USER}/"
 chown -R "${USER}:${USER}" "/home/${USER}"
 passwd -l root
 ```
@@ -432,10 +449,17 @@ systemctl enable zfs-import-bpool.service
 
 ## Step 8 — GRUB installation
 
+Write the GRUB defaults:
+
 ```sh
 cat > /etc/default/grub <<'EOF'
 GRUB_DEFAULT=0
 GRUB_TIMEOUT=5
+# On ZFS root, GRUB can't reliably clear the recordfail flag in grubenv,
+# so every boot is treated as "previous boot failed" and
+# GRUB_RECORDFAIL_TIMEOUT (Ubuntu default: 30s, sometimes -1 = wait forever)
+# overrides GRUB_TIMEOUT. Pin it to the same 5s for predictable behaviour.
+GRUB_RECORDFAIL_TIMEOUT=5
 GRUB_DISTRIBUTOR="Ubuntu"
 GRUB_CMDLINE_LINUX_DEFAULT=""
 # 10_linux_zfs injects root=ZFS=<dataset> per menuentry; keep this empty.
@@ -443,15 +467,44 @@ GRUB_CMDLINE_LINUX=""
 GRUB_TERMINAL=console
 GRUB_DISABLE_OS_PROBER=true
 EOF
+```
 
+Build the initramfs (the `zfs-initramfs` package installed earlier hooks
+into this so `zfs.ko` and `spl.ko` are included):
+
+```sh
 update-initramfs -c -k all
+```
 
-# --no-nvram: we register descriptively-labelled EFI entries from outside
-# the chroot, after mirroring the ESP to disk 2.
+Verify the resulting image contains ZFS:
+
+```sh
+lsinitramfs /boot/initrd.img-* | grep -E 'zfs|spl'
+```
+
+Install the bootloader files to disk 1's ESP. `--no-nvram` skips creating
+a generic "Ubuntu" firmware entry; descriptively-labelled per-disk entries
+are registered from outside the chroot after mirroring the ESP to disk 2.
+
+```sh
 grub-install --target=x86_64-efi \
              --efi-directory=/boot/efi \
              --bootloader-id=ubuntu \
              --no-nvram --recheck
+```
+
+Confirm the bootloader files landed in the ESP:
+
+```sh
+ls /boot/efi/EFI/ubuntu/
+```
+
+You should see at minimum `shimx64.efi`, `grubx64.efi`, `mmx64.efi`, and a
+small stub `grub.cfg`.
+
+Generate `/boot/grub/grub.cfg`:
+
+```sh
 update-grub
 ```
 
@@ -463,7 +516,7 @@ Found initrd image: initrd.img-6.8.0-NN-generic in rpool/ROOT/ubuntu_<host>
 ```
 
 If you see no such lines, `10_linux_zfs` is failing — see
-[Troubleshooting](#troubleshooting).
+[Troubleshooting](#troubleshooting). Fix it before exiting the chroot.
 
 ### Exit the chroot
 
@@ -533,9 +586,8 @@ SSH in:
 ssh "$USER@<ip>"
 ```
 
-Ubuntu's stock sshd accepts password auth, but the account is
-password-locked unless you set `PWHASH` during install. Either log in with
-your SSH key and `sudo passwd $USER`, or set the password during install.
+Ubuntu's stock sshd accepts both key and password authentication; either
+works. `sudo` will then prompt for the user's password.
 
 # Verification
 
